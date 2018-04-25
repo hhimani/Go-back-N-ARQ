@@ -9,13 +9,13 @@ When the receiver detects an error in a packet, it automatically requests the tr
 
 Running the Sender/client
 
-python Sender.py  <ip of server> <port of server> RFC123.txt <window> <mss> 
+python client.py  <ip of server> <port of server> RFC123.txt <window> <mss> 
 
-python sender.py localhost 7735 RFC123.txt 5 500
+python client.py localhost 7735 RFC123.txt 5 500
 Running the Receiver/Server
 
 
-python Receiver.py <port of server> RFC123.txt p 
+python server.py <port of server> RFC123.txt p 
 
 
-python receiver.py 7735 RFC123.txt 0.05
+python server.py 7735 RFC123.txt 0.05
