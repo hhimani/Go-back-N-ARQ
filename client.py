@@ -5,164 +5,122 @@ import struct
 import threading
 import os
 
-command_line_input  = True
+N = 20
+lock = threading.Lock()
+packets_to_send = []
+prev_seq = -1
+packets_sent_not_acked = 0
 
-N = 10
-Window_Lock = threading.Lock()
-Retransmit_time = 0.05
-Data_Packets = []
-Time_Stamp =[]
-Last_Ack = -1
-In_Transit = 0
-
-
-def Calculate_CheckSum(data):
-    sum_element = 0
+def validate_checksum(data):
+    s = 0
     for i in range(0, len(data), 2):
         if i + 1 < len(data):
-            element_16bits = ord(data[i]) + (ord(data[i + 1]) << 8)
-            k = sum_element + element_16bits
-            a = (k & 0xffff)
-            b = k >> 16
-            sum_element = a + b  # carry around addition
-    return ~sum_element & 0xffff
+            w = ord(data[i]) + (ord(data[i + 1]) << 8)
+            k = s + w
+            s = (k & 0xffff) + (k >> 16)
+    return ~s & 0xffff
 
+def create_packet(seq,data):
+    checksum = validate_checksum(data)
+    header = struct.pack('!IHH',seq, checksum, 21845)
+    return header + data
 
-def Create_packet(present_sequence,packet_data):
-    check_sum = Calculate_CheckSum(packet_data)
-    header = struct.pack('!IHH',present_sequence, check_sum, 21845)
-    packet = header + packet_data
-    return packet
-
-def Make_data_packets(File_name,MSS):
-    global Data_Packets
-
-    if os.path.isfile(File_name):
-
-        packet_data = ''
-        present_sequence = 0
-
-        file_reader = open(File_name, 'rb')
-        read_onebyte = file_reader.read(1)
-        packet_data += read_onebyte
-
-        while packet_data != '':
-            if len(packet_data) == MSS or read_onebyte == '':
-                Data_Packets.append(Create_packet(present_sequence,packet_data)) # send packet by adding header information
-                packet_data = ''
-                present_sequence += 1
-            read_onebyte = file_reader.read(1)
-            packet_data += read_onebyte
-
-        packet_data = 'endofframe'
-        Data_Packets.append(Create_packet(present_sequence, packet_data))
-        file_reader.close()
+def create_packets(filename,MSS):
+    global packets_to_send
+    if os.path.isfile(filename):
+        content = ''
+        seq = 0
+        f = open(filename, 'rb')
+        byte = f.read(1)
+        content += byte
+        while content != '':
+            if len(content) == MSS or byte == '':
+                packets_to_send.append(create_packet(seq,content))
+                content = ''
+                seq += 1
+            byte = f.read(1)
+            content += byte
+        packets_to_send.append(create_packet(seq, '!E!O!F!'))
+        f.close()
     else:
-        print 'File dosenot exist in the given location. Please Check \n'
+        print 'File not present.\n'
         sys.exit()
 
+def rdt_send(addr, client_socket, N):
+    global packets_to_send, prev_seq, packets_sent_not_acked
+    num_of_packets = len(packets_to_send)
+    time_record = [None]*num_of_packets
+    while (prev_seq + 1) < num_of_packets:
+        lock.acquire()
+        if packets_sent_not_acked < N and ((prev_seq + packets_sent_not_acked + 1) < num_of_packets):
+            client_socket.sendto(packets_to_send[prev_seq + packets_sent_not_acked + 1], addr)
+            time_record[prev_seq + packets_sent_not_acked + 1] = time.time()
+            packets_sent_not_acked += 1
+        if packets_sent_not_acked > 0:
+            # Taking 0.1 as RTO
+            if (time.time() - time_record[prev_seq + 1]) > 0.1:
+                print 'Time out, Sequence Number =' + str(prev_seq+1)
+                packets_sent_not_acked = 0
+        lock.release()
 
-def rdf_send(Server_Address, Client_Socket, N):
-    print 'rdf_send thread started'
-    global Data_Packets
-    global Last_Ack
-    global In_Transit
-    global Time_Stamp
-
-    Time_Stamp = [None]*len(Data_Packets)
-    while (Last_Ack + 1) < len(Data_Packets):
-        Window_Lock.acquire()
-        if In_Transit < N and ((Last_Ack + In_Transit + 1) < len(Data_Packets)):            #Send More Packets
-            Client_Socket.sendto(Data_Packets[Last_Ack + In_Transit + 1], Server_Address)
-            Time_Stamp[Last_Ack + In_Transit + 1] = time.time()
-            In_Transit += 1
-        if In_Transit > 0:
-            if (time.time() - Time_Stamp[Last_Ack + 1]) > Retransmit_time:
-                print 'Time out, Sequence Number =' + str(Last_Ack+1)
-                In_Transit = 0
-        Window_Lock.release()
-
-
-
-def Split_Ack_Header(Ack_Data):
-    Ack = struct.unpack('!IHH', Ack_Data)
-    seq_num = Ack[0]
-    if Ack[1] == 0 and Ack[2] == 43690:
-        valid_ack = True
+def get_ack_attr(ack_packet):
+    ack = struct.unpack('!IHH', ack_packet)
+    seq_num = ack[0]
+    is_valid = False
+    if ack[1] == 0 and ack[2] == 43690:
+        is_valid = True
     else:
-        print 'Invalid Frame as Header Format dosent match'
-        valid_ack = False
-    return valid_ack, seq_num
+        print 'Invalid Header Format'
+    return is_valid, seq_num
 
-
-def Ack_Receiver(Client_Socket):
-    print "Client Thread to Receive Acknowledgements Started \n"
-    global Last_Ack
-    global In_Transit
-    global Time_Stamp
-    global Data_Packets
-
+def get_acks(client_socket):
+    global prev_seq, packets_sent_not_acked, packets_to_send
     try:
-        while (Last_Ack + 1) < len(Data_Packets):
-            if In_Transit > 0:
-                Ack_Data, Server_Address = Client_Socket.recvfrom(2048)
-                Valid_frame, Sequence_Number = Split_Ack_Header(Ack_Data)
-                Window_Lock.acquire()
-                if Valid_frame:
-                    if Last_Ack+1 == Sequence_Number:
-                        Last_Ack += 1
-                        In_Transit -= 1
+        while (prev_seq + 1) < len(packets_to_send):
+            if packets_sent_not_acked > 0:
+                ack_packet, addr = client_socket.recvfrom(2048)
+                is_valid, seq_num = get_ack_attr(ack_packet)
+                lock.acquire()
+                if is_valid:
+                    if prev_seq+1 == seq_num:
+                        prev_seq += 1
+                        packets_sent_not_acked -= 1
                     else:
-                        In_Transit = 0
+                        packets_sent_not_acked = 0
                 else:
-                    In_Transit = 0
-
-                Window_Lock.release()
-
+                    packets_sent_not_acked = 0
+                lock.release()
     except:
-        print "Server closed its connection"
-        Client_Socket.close()
+        print "Server connection closed"
+        client_socket.close()
         sys.exit()
-
 
 def main():
-
-    if command_line_input:
+    global N
+    host_name = '192.168.172.1'
+    server_port = 7735
+    filename = 'RFC123.txt'
+    MSS = 500
+    if len(sys.argv) > 1:
         host_name = sys.argv[1]
         server_port = int(sys.argv[2])
-        File_name = sys.argv[3]
+        filename = sys.argv[3]
         N = int(sys.argv[4])
         MSS = int(sys.argv[5])
-    else:
-        host_name = '192.168.179.1'
-        server_port = 7735
-        File_name = 's.txt'
-        N = 10
-        MSS = 500
-
-    Server_Address = (host_name, server_port)
-    #my_ip = socket.gethostbyname(socket.gethostname())
+    addr = (host_name, server_port)
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    port = 1234
+    port = 8282
     client_socket.bind(( '0.0.0.0' , port))
-    print 'running at port' + str(port) + 'and server ip addr is ' +str(Server_Address)
-    Make_data_packets(File_name,MSS)
-
-    startTime = time.time()
-
-    Ack_receiver_thread = threading.Thread(target=Ack_Receiver, args=(client_socket,))
-    rdf_send_thread = threading.Thread(target=rdf_send,args=(Server_Address, client_socket, N))
-
-    Ack_receiver_thread.start()
-    rdf_send_thread.start()
-
-    Ack_receiver_thread.join()
-    rdf_send_thread.join()
-    print 'Ending Program'
-
-    endTime = time.time()
-    print 'Total Time Taken:' + str(endTime - startTime)
-
+    print 'Client Port :-' + str(port) + 'Server Address :- ' +str(addr)
+    create_packets(filename,MSS)
+    start = time.time()
+    get_acks_thread = threading.Thread(target=get_acks, args=(client_socket,))
+    rdt_send_thread = threading.Thread(target=rdt_send,args=(addr, client_socket, N))
+    get_acks_thread.start()
+    rdt_send_thread.start()
+    get_acks_thread.join()
+    rdt_send_thread.join()
+    print 'Time for file transfer:' + str(time.time() - start)
     if client_socket:
         client_socket.close()
 
